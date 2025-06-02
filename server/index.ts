@@ -58,7 +58,8 @@ app.use((req, res, next) => {
     serveStatic(app);
   }
 
-  const port = 5000;
+  // Use environment variable PORT or fallback to 5000
+  const port = process.env.PORT || 5000;
   server.listen(port, () => {
     log(`serving on port ${port}`);
   });
