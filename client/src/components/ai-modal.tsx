@@ -1,18 +1,27 @@
-import { useState } from "react";
+import { useState, useEffect } from "react";
 import { Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle } from "@/components/ui/dialog";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Textarea } from "@/components/ui/textarea";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
-import { Brain, MessageCircle, Zap, FileText, Loader2 } from "lucide-react";
-import { useMutation } from "@tanstack/react-query";
+import { Brain, MessageCircle, Zap, FileText, Loader2, AlertTriangle } from "lucide-react";
+import { useMutation, useQuery } from "@tanstack/react-query";
 import { apiRequest } from "@/lib/queryClient";
 import { useToast } from "@/hooks/use-toast";
+import { Select, SelectContent, SelectGroup, SelectItem, SelectLabel, SelectTrigger, SelectValue } from "@/components/ui/select";
+import type { Channel } from "@shared/schema";
+import type { Message, User } from "@shared/schema";
+
+interface MessageWithAuthor extends Message {
+  author: User;
+  replies?: MessageWithAuthor[];
+}
 
 interface AiModalProps {
   isOpen: boolean;
   onClose: () => void;
+  selectedMessage?: MessageWithAuthor | null;
 }
 
 interface ToneAnalysisResult {
@@ -21,12 +30,16 @@ interface ToneAnalysisResult {
   clarity: string;
   confidence: number;
   suggestions?: string[];
+  suggestedTones?: string[];
+  explanation?: string;
 }
 
 interface ReplyGenerationResult {
-  suggestedReply: string;
-  confidence: number;
-  reasoning: string;
+  suggestions: Array<{
+    suggestedReply: string;
+    confidence: number;
+    reasoning: string;
+  }>;
 }
 
 interface OrgMemoryResult {
@@ -49,71 +62,156 @@ interface MeetingNotesResult {
   decisions: string[];
 }
 
-export function AiModal({ isOpen, onClose }: AiModalProps) {
+export function AiModal({ isOpen, onClose, selectedMessage }: AiModalProps) {
   const { toast } = useToast();
   const [toneText, setToneText] = useState("");
   const [replyContext, setReplyContext] = useState("");
   const [orgQuery, setOrgQuery] = useState("");
-  const [meetingChannelId, setMeetingChannelId] = useState("");
+  const [selectedChannelId, setSelectedChannelId] = useState<string>("");
+
+  const { data: channels = [] } = useQuery<Channel[]>({
+    queryKey: ["/api/channels"],
+  });
 
   const toneAnalysis = useMutation({
     mutationFn: async (content: string) => {
       const res = await apiRequest("POST", "/api/ai/analyze-tone", { content });
+      if (!res.ok) {
+        const error = await res.json();
+        throw new Error(error.message || "Failed to analyze tone");
+      }
       return await res.json();
     },
-    onError: () => {
+    onError: (error) => {
       toast({
         title: "AI Analysis Failed",
-        description: "Could not analyze tone. Please check your connection.",
+        description: error instanceof Error ? error.message : "Could not analyze tone. Please try again.",
         variant: "destructive",
       });
-    },
+    }
   });
 
-  const replyGeneration = useMutation({
-    mutationFn: async (data: { messageContent: string; threadContext: string }) => {
+  const replyGeneration = useMutation<
+    ReplyGenerationResult,
+    Error,
+    { messageContent: string; threadContext: string }
+  >({
+    mutationFn: async (input) => {
+      console.log("[AI Modal] Generating reply for:", input);
+
+      if (!input.messageContent.trim()) {
+        throw new Error("Message content is required");
+      }
+
+      const contextLines = input.threadContext.split('\n').filter(line => line.trim());
+      if (contextLines.length === 0) {
+        throw new Error("Thread context is required");
+      }
+
       const res = await apiRequest("POST", "/api/ai/suggest-reply", {
-        messageContent: data.messageContent,
-        threadContext: data.threadContext.split('\n'),
+        messageContent: contextLines[0], // First line is the message to reply to
+        threadContext: contextLines.slice(1), // Rest is context
+        orgContext: "AI Assistant modal conversation", // Default context for modal
+        messageId: null, // Explicitly indicate this is not tied to a message
+        generateMultiple: true // Request multiple suggestions
       });
-      return await res.json();
+
+      if (!res.ok) {
+        const errorData = await res.json();
+        throw new Error(errorData.details || errorData.message || "Failed to generate reply");
+      }
+
+      const responseData = await res.json();
+      console.log("[AI Modal] Received reply suggestions:", responseData);
+
+      if (!responseData || !Array.isArray(responseData.suggestions)) {
+        throw new Error("Invalid response format from server");
+      }
+
+      return responseData;
     },
-    onError: () => {
+    onError: (error) => {
+      console.error("[AI Modal] Reply generation error:", error);
       toast({
         title: "Reply Generation Failed",
-        description: "Could not generate reply suggestions.",
+        description: error instanceof Error ? error.message : "Could not generate reply suggestions.",
         variant: "destructive",
       });
-    },
+    }
   });
 
   const orgMemoryQuery = useMutation({
     mutationFn: async (query: string) => {
+      console.log("[AI Modal] Querying org memory:", query);
+      
       const res = await apiRequest("POST", "/api/ai/org-memory", { query });
-      return await res.json();
+      
+      if (!res.ok) {
+        const errorData = await res.json();
+        throw new Error(errorData.details || errorData.message || "Failed to query organizational memory");
+      }
+
+      const data = await res.json();
+      console.log("[AI Modal] Org memory response:", data);
+
+      if (!data || !data.summary) {
+        throw new Error("Invalid response format from server");
+      }
+
+      return data;
     },
-    onError: () => {
+    onError: (error) => {
+      console.error("[AI Modal] Org memory error:", error);
       toast({
         title: "Organization Memory Failed",
-        description: "Could not search organizational knowledge.",
+        description: error instanceof Error ? error.message : "Could not search organizational knowledge.",
         variant: "destructive",
       });
     },
   });
 
-  const meetingNotes = useMutation({
+  const meetingNotes = useMutation<
+    MeetingNotesResult,
+    Error,
+    number
+  >({
     mutationFn: async (channelId: number) => {
-      const res = await apiRequest("POST", "/api/ai/meeting-notes", { channelId });
-      return await res.json();
+      console.log("[AI Modal] Generating meeting notes for channel:", channelId);
+
+      const res = await apiRequest("POST", "/api/ai/generate-notes", { 
+        channelId 
+      });
+
+      if (!res.ok) {
+        const errorData = await res.json();
+        throw new Error(errorData.details || errorData.message || "Failed to generate notes");
+      }
+
+      const data = await res.json();
+      console.log("[AI Modal] Generated meeting notes:", data);
+
+      if (!data || !data.title || !data.summary) {
+        throw new Error("Invalid response format from server");
+      }
+
+      return data;
     },
-    onError: () => {
+    onError: (error) => {
+      console.error("[AI Modal] Meeting notes generation error:", error);
       toast({
         title: "Meeting Notes Failed",
-        description: "Could not generate meeting notes.",
+        description: error instanceof Error ? error.message : "Could not generate meeting notes.",
         variant: "destructive",
       });
-    },
+    }
   });
+
+  // Update reply context when selected message changes
+  useEffect(() => {
+    if (selectedMessage) {
+      setReplyContext(selectedMessage.content || "");
+    }
+  }, [selectedMessage]);
 
   const handleToneAnalysis = () => {
     if (!toneText.trim()) {
@@ -131,23 +229,15 @@ export function AiModal({ isOpen, onClose }: AiModalProps) {
     if (!replyContext.trim()) {
       toast({
         title: "Context Required",
-        description: "Please provide message context for reply generation.",
+        description: "Please provide the message you want to reply to.",
         variant: "destructive",
       });
       return;
     }
-    const lines = replyContext.split('\n');
-    if (lines.length < 1) {
-      toast({
-        title: "Invalid Context",
-        description: "Please provide at least one message for context.",
-        variant: "destructive",
-      });
-      return;
-    }
+    
     replyGeneration.mutate({
-      messageContent: lines[0],
-      threadContext: replyContext,
+      messageContent: replyContext,
+      threadContext: replyContext
     });
   };
 
@@ -164,16 +254,16 @@ export function AiModal({ isOpen, onClose }: AiModalProps) {
   };
 
   const handleMeetingNotes = () => {
-    const channelId = parseInt(meetingChannelId);
-    if (!channelId || isNaN(channelId)) {
+    const channelIdValue = parseInt(selectedChannelId);
+    if (!selectedChannelId) {
       toast({
-        title: "Channel ID Required",
-        description: "Please provide a valid channel ID.",
+        title: "Channel Required",
+        description: "Please select a channel to generate notes from.",
         variant: "destructive",
       });
       return;
     }
-    meetingNotes.mutate(channelId);
+    meetingNotes.mutate(channelIdValue);
   };
 
   return (
@@ -189,7 +279,7 @@ export function AiModal({ isOpen, onClose }: AiModalProps) {
           </DialogDescription>
         </DialogHeader>
 
-        <Tabs defaultValue="tone" className="w-full">
+        <Tabs defaultValue={selectedMessage ? "reply" : "tone"} className="w-full">
           <TabsList className="grid w-full grid-cols-4 bg-slate-800">
             <TabsTrigger value="tone" className="data-[state=active]:bg-slate-700">
               <Zap className="h-4 w-4 mr-2" />
@@ -241,34 +331,67 @@ export function AiModal({ isOpen, onClose }: AiModalProps) {
                     </>
                   )}
                 </Button>
+
+                {toneAnalysis.isError && (
+                  <div className="mt-4 p-4 bg-red-900/20 border border-red-700/30 rounded-lg">
+                    <div className="flex items-center gap-2 text-red-400">
+                      <AlertTriangle className="h-4 w-4" />
+                      <p className="text-sm">Failed to analyze tone. Please try again.</p>
+                    </div>
+                  </div>
+                )}
                 
                 {toneAnalysis.data && (
                   <div className="mt-4 p-4 bg-slate-700 rounded-lg">
-                    <h4 className="text-white font-semibold mb-2">Analysis Results</h4>
-                    <div className="grid grid-cols-3 gap-4 text-sm">
-                      <div>
-                        <span className="text-slate-400">Tone:</span>
-                        <p className="text-white">{toneAnalysis.data.tone}</p>
+                    <h4 className="text-white font-semibold mb-4">Analysis Results</h4>
+                    <div className="space-y-4">
+                      <div className="grid grid-cols-3 gap-4">
+                        <div className="bg-slate-800 p-3 rounded-lg">
+                          <span className="text-slate-400 block mb-1">Current Tone:</span>
+                          <p className="text-lg font-medium text-white">{toneAnalysis.data?.tone}</p>
+                        </div>
+                        <div className="bg-slate-800 p-3 rounded-lg">
+                          <span className="text-slate-400 block mb-1">Impact:</span>
+                          <p className="text-lg font-medium text-white">{toneAnalysis.data?.impact}</p>
+                        </div>
+                        <div className="bg-slate-800 p-3 rounded-lg">
+                          <span className="text-slate-400 block mb-1">Clarity:</span>
+                          <p className="text-lg font-medium text-white">{toneAnalysis.data?.clarity}</p>
+                        </div>
                       </div>
-                      <div>
-                        <span className="text-slate-400">Impact:</span>
-                        <p className="text-white">{toneAnalysis.data.impact}</p>
-                      </div>
-                      <div>
-                        <span className="text-slate-400">Clarity:</span>
-                        <p className="text-white">{toneAnalysis.data.clarity}</p>
-                      </div>
+
+                      {toneAnalysis.data?.suggestedTones && toneAnalysis.data.suggestedTones.length > 0 && (
+                        <div className="bg-slate-800 p-4 rounded-lg">
+                          <h5 className="text-slate-400 mb-2">Suggested Alternative Tones:</h5>
+                          <div className="flex flex-wrap gap-2">
+                            {toneAnalysis.data.suggestedTones.map((tone: string, index: number) => (
+                              <span key={index} className="px-3 py-1 bg-purple-600/30 text-purple-200 rounded-full text-sm">
+                                {tone}
+                              </span>
+                            ))}
+                          </div>
+                          {toneAnalysis.data.explanation && (
+                            <p className="mt-2 text-sm text-slate-300">
+                              {toneAnalysis.data.explanation}
+                            </p>
+                          )}
+                        </div>
+                      )}
+
+                      {toneAnalysis.data?.suggestions && toneAnalysis.data.suggestions.length > 0 && (
+                        <div className="bg-slate-800 p-4 rounded-lg">
+                          <h5 className="text-slate-400 mb-2">Improvement Suggestions:</h5>
+                          <ul className="space-y-2">
+                            {toneAnalysis.data.suggestions.map((suggestion: string, index: number) => (
+                              <li key={index} className="flex items-start gap-2 text-white">
+                                <span className="text-purple-400">•</span>
+                                <span className="text-sm">{suggestion}</span>
+                              </li>
+                            ))}
+                          </ul>
+                        </div>
+                      )}
                     </div>
-                    {toneAnalysis.data.suggestions && (
-                      <div className="mt-3">
-                        <span className="text-slate-400">Suggestions:</span>
-                        <ul className="text-white text-sm mt-1 space-y-1">
-                          {toneAnalysis.data.suggestions.map((suggestion: string, index: number) => (
-                            <li key={index}>• {suggestion}</li>
-                          ))}
-                        </ul>
-                      </div>
-                    )}
                   </div>
                 )}
               </CardContent>
@@ -285,7 +408,7 @@ export function AiModal({ isOpen, onClose }: AiModalProps) {
               </CardHeader>
               <CardContent className="space-y-4">
                 <Textarea
-                  placeholder="Paste the message context (one message per line)..."
+                  placeholder="Message to reply to..."
                   value={replyContext}
                   onChange={(e) => setReplyContext(e.target.value)}
                   className="bg-slate-700 border-slate-600 text-white min-h-[120px]"
@@ -309,17 +432,21 @@ export function AiModal({ isOpen, onClose }: AiModalProps) {
                 </Button>
                 
                 {replyGeneration.data && (
-                  <div className="mt-4 p-4 bg-slate-700 rounded-lg">
-                    <h4 className="text-white font-semibold mb-2">Suggested Reply</h4>
-                    <p className="text-white mb-3 p-3 bg-slate-600 rounded">
-                      {replyGeneration.data.suggestedReply}
-                    </p>
-                    <p className="text-sm text-slate-400">
-                      <strong>Reasoning:</strong> {replyGeneration.data.reasoning}
-                    </p>
-                    <p className="text-sm text-slate-400">
-                      <strong>Confidence:</strong> {Math.round(replyGeneration.data.confidence * 100)}%
-                    </p>
+                  <div className="mt-4 space-y-4">
+                    <h4 className="text-white font-semibold mb-2">Suggested Replies</h4>
+                    {replyGeneration.data.suggestions.map((suggestion, index) => (
+                      <div key={index} className="p-4 bg-slate-700 rounded-lg">
+                        <p className="text-white mb-3 p-3 bg-slate-600 rounded">
+                          {suggestion.suggestedReply}
+                        </p>
+                        <p className="text-sm text-slate-400">
+                          <strong>Reasoning:</strong> {suggestion.reasoning}
+                        </p>
+                        <p className="text-sm text-slate-400">
+                          <strong>Confidence:</strong> {Math.round(suggestion.confidence)}%
+                        </p>
+                      </div>
+                    ))}
                   </div>
                 )}
               </CardContent>
@@ -402,12 +529,29 @@ export function AiModal({ isOpen, onClose }: AiModalProps) {
                 </CardDescription>
               </CardHeader>
               <CardContent className="space-y-4">
-                <Input
-                  placeholder="Enter channel ID (e.g., 1 for #general)"
-                  value={meetingChannelId}
-                  onChange={(e) => setMeetingChannelId(e.target.value)}
-                  className="bg-slate-700 border-slate-600 text-white"
-                />
+                <Select
+                  value={selectedChannelId}
+                  onValueChange={setSelectedChannelId}
+                >
+                  <SelectTrigger className="bg-slate-700 border-slate-600 text-white">
+                    <SelectValue placeholder="Select a channel" />
+                  </SelectTrigger>
+                  <SelectContent>
+                    <SelectGroup>
+                      <SelectLabel>Available Channels</SelectLabel>
+                      {channels.map(channel => (
+                        <SelectItem 
+                          key={channel.id} 
+                          value={channel.id.toString()}
+                          className="text-white"
+                        >
+                          #{channel.name}
+                        </SelectItem>
+                      ))}
+                    </SelectGroup>
+                  </SelectContent>
+                </Select>
+
                 <Button 
                   onClick={handleMeetingNotes}
                   disabled={meetingNotes.isPending}
@@ -425,6 +569,20 @@ export function AiModal({ isOpen, onClose }: AiModalProps) {
                     </>
                   )}
                 </Button>
+
+                {meetingNotes.isError && (
+                  <div className="mt-4 p-4 bg-red-900/20 border border-red-700/30 rounded-lg">
+                    <div className="flex items-center gap-2 text-red-400 mb-2">
+                      <AlertTriangle className="h-4 w-4" />
+                      <h5 className="font-medium">Error Generating Notes</h5>
+                    </div>
+                    <p className="text-sm text-slate-300">
+                      {meetingNotes.error instanceof Error 
+                        ? meetingNotes.error.message 
+                        : "Failed to generate meeting notes. Please try again."}
+                    </p>
+                  </div>
+                )}
                 
                 {meetingNotes.data && (
                   <div className="mt-4 p-4 bg-slate-700 rounded-lg">
@@ -432,7 +590,7 @@ export function AiModal({ isOpen, onClose }: AiModalProps) {
                     <p className="text-white mb-4">{meetingNotes.data.summary}</p>
                     
                     <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-                      {meetingNotes.data.keyPoints && (
+                      {meetingNotes.data.keyPoints && meetingNotes.data.keyPoints.length > 0 && (
                         <div>
                           <h5 className="text-slate-400 font-medium mb-2">Key Points:</h5>
                           <ul className="text-white text-sm space-y-1">
@@ -443,7 +601,7 @@ export function AiModal({ isOpen, onClose }: AiModalProps) {
                         </div>
                       )}
                       
-                      {meetingNotes.data.actionItems && (
+                      {meetingNotes.data.actionItems && meetingNotes.data.actionItems.length > 0 && (
                         <div>
                           <h5 className="text-slate-400 font-medium mb-2">Action Items:</h5>
                           <ul className="text-white text-sm space-y-1">
@@ -454,14 +612,14 @@ export function AiModal({ isOpen, onClose }: AiModalProps) {
                         </div>
                       )}
                       
-                      {meetingNotes.data.participants && (
+                      {meetingNotes.data.participants && meetingNotes.data.participants.length > 0 && (
                         <div>
                           <h5 className="text-slate-400 font-medium mb-2">Participants:</h5>
                           <p className="text-white text-sm">{meetingNotes.data.participants.join(", ")}</p>
                         </div>
                       )}
                       
-                      {meetingNotes.data.decisions && (
+                      {meetingNotes.data.decisions && meetingNotes.data.decisions.length > 0 && (
                         <div>
                           <h5 className="text-slate-400 font-medium mb-2">Decisions:</h5>
                           <ul className="text-white text-sm space-y-1">

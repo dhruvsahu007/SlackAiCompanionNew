@@ -30,13 +30,14 @@ interface MessageInputProps {
 
 export function MessageInput({ channelId, recipientId, onMessageSent }: MessageInputProps) {
   const { user } = useAuth();
-  const { sendTyping } = useWebSocket();
+  const { sendTyping, broadcastMessage } = useWebSocket();
   const { toast } = useToast();
   const queryClient = useQueryClient();
   const [content, setContent] = useState("");
   const [toneAnalysis, setToneAnalysis] = useState<any>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const typingTimeoutRef = useRef<NodeJS.Timeout>();
+  const [showSuggestions, setShowSuggestions] = useState(false);
 
   // Send message mutation
   const sendMessageMutation = useMutation({
@@ -53,10 +54,14 @@ export function MessageInput({ channelId, recipientId, onMessageSent }: MessageI
         queryClient.invalidateQueries({
           queryKey: ["/api/channels", channelId, "messages"]
         });
+        // Broadcast to channel
+        broadcastMessage(channelId, message);
       } else if (recipientId) {
         queryClient.invalidateQueries({
           queryKey: ["/api/direct-messages", recipientId]
         });
+        // Broadcast DM with recipientId
+        broadcastMessage(0, { ...message, recipientId }); // Use channelId 0 to indicate DM
       }
 
       onMessageSent?.(message);
@@ -89,12 +94,47 @@ export function MessageInput({ channelId, recipientId, onMessageSent }: MessageI
   // AI compose mutation
   const aiComposeMutation = useMutation({
     mutationFn: async () => {
-      // This would generate a message based on context
-      return { suggestedContent: "AI-generated message based on conversation context" };
+      if (!channelId) throw new Error("No channel selected");
+
+      // Get last 5 messages for context
+      const contextMessages = await apiRequest("GET", `/api/channels/${channelId}/messages?limit=5`);
+      const messagesData = await contextMessages.json();
+      
+      const response = await apiRequest("POST", "/api/ai/suggest-reply", {
+        messageContent: "Compose a new message",
+        threadContext: messagesData.map((msg: any) => msg.content),
+        orgContext: `Channel: ${channelId}`,
+        generateMultiple: true
+      });
+
+      if (!response.ok) {
+        const error = await response.json();
+        throw new Error(error.message || "Failed to generate message");
+      }
+
+      const data = await response.json();
+      return data;
     },
     onSuccess: (result) => {
-      setContent(result.suggestedContent);
-      handleToneAnalysis(result.suggestedContent);
+      // Use the first suggestion by default
+      if (result.suggestions && result.suggestions.length > 0) {
+        const firstSuggestion = result.suggestions[0];
+        setContent(firstSuggestion.suggestedReply);
+        handleToneAnalysis(firstSuggestion.suggestedReply);
+        toast({
+          title: "Message Composed",
+          description: "AI has suggested a message based on the channel context",
+        });
+      } else {
+        throw new Error("No suggestions received");
+      }
+    },
+    onError: (error) => {
+      toast({
+        title: "Failed to compose message",
+        description: error instanceof Error ? error.message : "Please try again",
+        variant: "destructive",
+      });
     }
   });
 
@@ -188,6 +228,39 @@ export function MessageInput({ channelId, recipientId, onMessageSent }: MessageI
   return (
     <div className="bg-slate-800 border-t border-slate-700 p-4">
       <div className="relative">
+        {aiComposeMutation.data?.suggestions && showSuggestions && (
+          <div className="absolute bottom-full mb-2 w-full bg-slate-900 rounded-lg border border-slate-700 p-4 space-y-3">
+            <div className="flex items-center justify-between mb-2">
+              <span className="text-sm font-medium text-white">AI Suggestions</span>
+              <Button
+                variant="ghost"
+                size="sm"
+                onClick={() => setShowSuggestions(false)}
+                className="text-slate-400 hover:text-white"
+              >
+                Close
+              </Button>
+            </div>
+            {aiComposeMutation.data.suggestions.map((suggestion: any, index: number) => (
+              <div key={index} className="bg-slate-800 rounded-lg p-3">
+                <p className="text-sm text-slate-300 mb-2">{suggestion.suggestedReply}</p>
+                <Button
+                  size="sm"
+                  variant="ghost"
+                  onClick={() => {
+                    setContent(suggestion.suggestedReply);
+                    handleToneAnalysis(suggestion.suggestedReply);
+                    setShowSuggestions(false);
+                  }}
+                  className="text-purple-400 hover:text-purple-300"
+                >
+                  Use this suggestion
+                </Button>
+              </div>
+            ))}
+          </div>
+        )}
+
         <div className="bg-white rounded-lg border border-gray-300 focus-within:border-blue-500 transition-colors">
           {/* Formatting Toolbar */}
           <div className="flex items-center p-3 border-b border-gray-200">
@@ -208,12 +281,23 @@ export function MessageInput({ channelId, recipientId, onMessageSent }: MessageI
               <Button
                 variant="ghost"
                 size="sm"
-                onClick={() => aiComposeMutation.mutate()}
+                onClick={() => {
+                  aiComposeMutation.mutate();
+                  setShowSuggestions(true);
+                }}
                 disabled={aiComposeMutation.isPending}
                 className="bg-purple-600 text-white hover:bg-purple-700 transition-colors"
               >
-                <Brain className="h-4 w-4 mr-1" />
-                AI Compose
+                {aiComposeMutation.isPending ? (
+                  <>
+                    <span className="animate-pulse">Composing...</span>
+                  </>
+                ) : (
+                  <>
+                    <Brain className="h-4 w-4 mr-1" />
+                    AI Compose
+                  </>
+                )}
               </Button>
             </div>
           </div>

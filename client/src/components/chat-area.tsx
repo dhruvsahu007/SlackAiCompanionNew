@@ -1,7 +1,7 @@
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import { useAuth } from "@/hooks/use-auth";
 import { useWebSocket } from "@/hooks/use-websocket";
-import { useState, useEffect, useRef } from "react";
+import { useState, useEffect, useRef, ReactNode } from "react";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
 import { Avatar, AvatarFallback, AvatarImage } from "@/components/ui/avatar";
@@ -22,17 +22,32 @@ import {
   CheckCircle
 } from "lucide-react";
 import { formatDistanceToNow } from "date-fns";
-import type { Channel, Message, User } from "@shared/schema";
+import type { Channel, User } from "@shared/schema";
 import { apiRequest } from "@/lib/queryClient";
+import { useToast } from "@/hooks/use-toast";
+import { Dialog, DialogContent, DialogHeader, DialogTitle } from "@/components/ui/dialog";
+import { Textarea } from "@/components/ui/textarea";
+import type { MessageWithAuthor } from "@/types/message";
 
 interface ChatAreaProps {
   selectedChannel: number | null;
   selectedDmUser: number | null;
 }
 
-interface MessageWithAuthor extends Message {
-  author: User;
-  replies?: MessageWithAuthor[];
+interface MessageAuthor {
+  id: number;
+  username: string;
+  displayName: string;
+  avatar: string | null;
+  status: string;
+  title: string | null;
+}
+
+interface WebSocketMessageData {
+  authorId: number;
+  recipientId: number | null;
+  channelId: number | null;
+  content: string;
 }
 
 export function ChatArea({ selectedChannel, selectedDmUser }: ChatAreaProps) {
@@ -41,6 +56,9 @@ export function ChatArea({ selectedChannel, selectedDmUser }: ChatAreaProps) {
   const queryClient = useQueryClient();
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const [expandedThreads, setExpandedThreads] = useState<Set<number>>(new Set());
+  const { toast } = useToast();
+  const [selectedMessage, setSelectedMessage] = useState<MessageWithAuthor | null>(null);
+  const [isAiModalOpen, setIsAiModalOpen] = useState(false);
 
   // Channel data
   const { data: channel } = useQuery<Channel>({
@@ -93,13 +111,26 @@ export function ChatArea({ selectedChannel, selectedDmUser }: ChatAreaProps) {
 
   useEffect(() => {
     if (lastMessage?.type === 'new_message') {
-      if (selectedChannel && lastMessage.message.channelId === selectedChannel) {
+      const messageData = lastMessage.message as WebSocketMessageData;
+      
+      // Handle channel messages
+      if (selectedChannel && messageData.channelId === selectedChannel) {
         queryClient.invalidateQueries({ 
           queryKey: ["/api/channels", selectedChannel, "messages"] 
         });
       }
+      
+      // Handle DMs
+      if (selectedDmUser && user?.id && (
+        (messageData.authorId === selectedDmUser && messageData.recipientId === user.id) ||
+        (messageData.authorId === user.id && messageData.recipientId === selectedDmUser)
+      )) {
+        queryClient.invalidateQueries({ 
+          queryKey: ["/api/direct-messages", selectedDmUser]
+        });
+      }
     }
-  }, [lastMessage, selectedChannel, queryClient]);
+  }, [lastMessage, selectedChannel, selectedDmUser, user, queryClient]);
 
   // Auto-scroll to bottom
   useEffect(() => {
@@ -109,14 +140,92 @@ export function ChatArea({ selectedChannel, selectedDmUser }: ChatAreaProps) {
   // AI reply suggestion mutation
   const suggestReplyMutation = useMutation({
     mutationFn: async (messageId: number) => {
-      const response = await apiRequest("POST", "/api/ai/suggest-reply", {
-        messageId,
-        threadContext: [], // Would include thread messages
-        orgContext: "" // Would include relevant org context
+      // Get the message and its context
+      const message = messages.find(m => m.id === messageId);
+      if (!message) throw new Error("Message not found");
+      
+      // Get last 5 messages before this one for context
+      const contextMessages = messages
+        .slice(0, messages.findIndex(m => m.id === messageId))
+        .slice(-5)
+        .map(m => m.content);
+
+      // Get channel description if available
+      const channelContext = selectedChannel && channel 
+        ? (channel.description ?? "No channel description") 
+        : "Direct message conversation";
+
+      console.log("[Client] Sending suggest reply request:", {
+        messageContent: message.content,
+        threadContextLength: contextMessages.length,
+        channelContext
       });
+
+      const response = await apiRequest("POST", "/api/ai/suggest-reply", {
+        messageContent: message.content,
+        threadContext: contextMessages,
+        orgContext: channelContext,
+        generateMultiple: true // Request multiple suggestions
+      });
+
+      if (!response.ok) {
+        const errorData = await response.json();
+        throw new Error(errorData.details || errorData.message || "Failed to generate reply");
+      }
+
+      const data = await response.json();
+      console.log("[Client] Received AI suggestions:", data);
+
+      return {
+        suggestions: data.suggestions,
+        messageId
+      };
+    },
+    onError: (error) => {
+      console.error("[Client] Reply generation error:", error);
+      toast({
+        title: "Failed to generate reply",
+        description: error instanceof Error ? error.message : "Please try again",
+        variant: "destructive"
+      });
+    }
+  });
+
+  // Send suggested reply mutation
+  const sendSuggestedReplyMutation = useMutation({
+    mutationFn: async ({ content, messageId }: { content: string; messageId: number }) => {
+      const messageData = {
+        content: content.trim(),
+        channelId: selectedChannel || undefined,
+        recipientId: selectedDmUser || undefined,
+        parentMessageId: messageId
+      };
+
+      const response = await apiRequest("POST", "/api/messages", messageData);
       return response.json();
     },
+    onSuccess: () => {
+      // Refresh messages
+      if (selectedChannel) {
+        queryClient.invalidateQueries({
+          queryKey: ["/api/channels", selectedChannel, "messages"]
+        });
+      }
+      toast({
+        title: "Reply sent",
+        description: "Your reply has been sent successfully",
+      });
+    },
+    onError: () => {
+      toast({
+        title: "Failed to send reply",
+        description: "Please try again",
+        variant: "destructive"
+      });
+    }
   });
+
+  const [editingReply, setEditingReply] = useState<{ content: string; messageId: number } | null>(null);
 
   // Generate meeting notes mutation
   const generateNotesMutation = useMutation({
@@ -166,14 +275,14 @@ export function ChatArea({ selectedChannel, selectedDmUser }: ChatAreaProps) {
     );
   };
 
-  const renderMessage = (message: MessageWithAuthor, isReply = false) => {
+  const renderMessage = (message: MessageWithAuthor, isReply = false): JSX.Element => {
     const isExpanded = expandedThreads.has(message.id);
     
     return (
       <div key={message.id} className={`group hover:bg-slate-800/50 p-3 rounded-lg transition-colors ${isReply ? 'ml-4 border-l-2 border-purple-600 pl-4' : ''}`}>
         <div className="flex items-start space-x-3">
           <Avatar className="h-8 w-8">
-            <AvatarImage src={message.author.avatar} />
+            <AvatarImage src={message.author.avatar || undefined} />
             <AvatarFallback className="bg-slate-600 text-white">
               {message.author.displayName.charAt(0).toUpperCase()}
             </AvatarFallback>
@@ -315,27 +424,87 @@ export function ChatArea({ selectedChannel, selectedDmUser }: ChatAreaProps) {
 
       {/* Messages */}
       <div className="flex-1 overflow-y-auto p-6 space-y-4">
-        {messages.map(message => renderMessage(message))}
+        {messages.map((message: MessageWithAuthor) => renderMessage(message))}
         
         {/* AI Suggestion Display */}
         {suggestReplyMutation.data && (
-          <div className="bg-purple-900/20 border border-purple-700/30 rounded-lg p-4">
-            <div className="flex items-center space-x-2 mb-2">
+          <div className="bg-purple-900/20 border border-purple-700/30 rounded-lg p-4 mb-4">
+            <div className="flex items-center space-x-2 mb-3">
               <Brain className="h-4 w-4 text-purple-400" />
-              <span className="text-sm font-medium text-purple-400">AI Suggested Reply</span>
+              <span className="text-sm font-medium text-purple-400">AI Suggested Replies</span>
             </div>
-            <p className="text-sm text-slate-300 mb-3">
-              {suggestReplyMutation.data.suggestedReply}
-            </p>
-            <div className="flex space-x-2">
-              <Button size="sm" className="bg-purple-600 hover:bg-purple-700 text-white">
-                Send Reply
-              </Button>
-              <Button variant="outline" size="sm" className="border-slate-600 text-slate-300">
-                Edit
-              </Button>
+            <div className="space-y-4">
+              {suggestReplyMutation.data.suggestions.map((suggestion: any, index: number) => (
+                <div key={index} className="bg-slate-800/50 rounded-lg p-3">
+                  <p className="text-sm text-slate-300 mb-3">{suggestion.suggestedReply}</p>
+                  <div className="flex space-x-2">
+                    <Button 
+                      size="sm" 
+                      className="bg-purple-600 hover:bg-purple-700 text-white"
+                      onClick={() => sendSuggestedReplyMutation.mutate({
+                        content: suggestion.suggestedReply,
+                        messageId: suggestReplyMutation.data.messageId
+                      })}
+                      disabled={sendSuggestedReplyMutation.isPending}
+                    >
+                      {sendSuggestedReplyMutation.isPending ? "Sending..." : "Send Reply"}
+                    </Button>
+                    <Button 
+                      variant="outline" 
+                      size="sm" 
+                      className="border-slate-600 text-slate-300"
+                      onClick={() => setEditingReply({
+                        content: suggestion.suggestedReply,
+                        messageId: suggestReplyMutation.data.messageId
+                      })}
+                    >
+                      Edit
+                    </Button>
+                  </div>
+                </div>
+              ))}
             </div>
           </div>
+        )}
+
+        {/* Edit Reply Dialog */}
+        {editingReply && (
+          <Dialog open={!!editingReply} onOpenChange={() => setEditingReply(null)}>
+            <DialogContent className="bg-slate-900 border-slate-700">
+              <DialogHeader>
+                <DialogTitle className="text-white">Edit Reply</DialogTitle>
+              </DialogHeader>
+              <div className="space-y-4">
+                <Textarea
+                  value={editingReply.content}
+                  onChange={(e) => setEditingReply({ ...editingReply, content: e.target.value })}
+                  className="bg-slate-800 border-slate-700 text-white min-h-[100px]"
+                />
+                <div className="flex space-x-2">
+                  <Button 
+                    className="bg-purple-600 hover:bg-purple-700 text-white"
+                    onClick={() => {
+                      sendSuggestedReplyMutation.mutate({
+                        content: editingReply.content,
+                        messageId: editingReply.messageId
+                      });
+                      setEditingReply(null);
+                    }}
+                    disabled={sendSuggestedReplyMutation.isPending}
+                  >
+                    {sendSuggestedReplyMutation.isPending ? "Sending..." : "Send Edited Reply"}
+                  </Button>
+                  <Button 
+                    variant="outline" 
+                    className="border-slate-600 text-slate-300"
+                    onClick={() => setEditingReply(null)}
+                  >
+                    Cancel
+                  </Button>
+                </div>
+              </div>
+            </DialogContent>
+          </Dialog>
         )}
 
         {/* Meeting Notes Display */}

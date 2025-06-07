@@ -24,7 +24,7 @@ import {
 } from "lucide-react";
 import { apiRequest, queryClient } from "@/lib/queryClient";
 import { useToast } from "@/hooks/use-toast";
-import type { Channel, User } from "@shared/schema";
+import type { Channel, User, InsertChannel } from "@shared/schema";
 
 interface SidebarProps {
   selectedChannel: number | null;
@@ -44,7 +44,7 @@ export function Sidebar({
   const [isChannelModalOpen, setIsChannelModalOpen] = useState(false);
   const [isProfileModalOpen, setIsProfileModalOpen] = useState(false);
   const [channelName, setChannelName] = useState("");
-  const [channelDescription, setChannelDescription] = useState("");
+  const [channelDescription, setChannelDescription] = useState<string>("");
   const [isPrivateChannel, setIsPrivateChannel] = useState(false);
 
   const { data: channels = [] } = useQuery<Channel[]>({
@@ -56,7 +56,7 @@ export function Sidebar({
   });
 
   const createChannelMutation = useMutation({
-    mutationFn: async (data: { name: string; description?: string; isPrivate: boolean }) => {
+    mutationFn: async (data: Omit<InsertChannel, "createdBy">) => {
       const res = await apiRequest("POST", "/api/channels", data);
       return await res.json();
     },
@@ -93,6 +93,26 @@ export function Sidebar({
     return <Circle className={`w-3 h-3 ${getStatusColor(status)} rounded-full`} />;
   };
 
+  const handleCreateChannel = () => {
+    const trimmedName = channelName.trim();
+    const trimmedDescription = channelDescription?.trim();
+
+    if (!trimmedName) {
+      toast({
+        title: "Channel Name Required",
+        description: "Please enter a name for the channel.",
+        variant: "destructive",
+      });
+      return;
+    }
+
+    createChannelMutation.mutate({
+      name: trimmedName.toLowerCase().replace(/\s+/g, '-'),
+      description: trimmedDescription || undefined,
+      isPrivate: isPrivateChannel
+    });
+  };
+
   return (
     <div className="w-64 bg-purple-900 flex flex-col border-r border-purple-800">
       {/* Workspace Header */}
@@ -119,7 +139,12 @@ export function Sidebar({
             <h3 className="text-sm font-medium text-slate-300 uppercase tracking-wide">
               Channels
             </h3>
-            <Button variant="ghost" size="icon" className="h-5 w-5 text-slate-300 hover:text-white">
+            <Button 
+              variant="ghost" 
+              size="icon" 
+              className="h-5 w-5 text-slate-300 hover:text-white"
+              onClick={() => setIsChannelModalOpen(true)}
+            >
               <Plus className="h-3 w-3" />
             </Button>
           </div>
@@ -224,6 +249,59 @@ export function Sidebar({
           </Button>
         </div>
       </div>
+
+      {/* Create Channel Modal */}
+      <Dialog open={isChannelModalOpen} onOpenChange={setIsChannelModalOpen}>
+        <DialogContent className="bg-slate-900 border-slate-700">
+          <DialogHeader>
+            <DialogTitle className="text-white">Create New Channel</DialogTitle>
+            <DialogDescription className="text-slate-400">
+              Add a new channel to your workspace
+            </DialogDescription>
+          </DialogHeader>
+          <div className="space-y-4">
+            <div>
+              <Label htmlFor="channel-name" className="text-white">Channel Name</Label>
+              <Input
+                id="channel-name"
+                value={channelName}
+                onChange={(e) => setChannelName(e.target.value)}
+                placeholder="e.g. project-updates"
+                className="bg-slate-800 border-slate-700 text-white mt-1"
+              />
+            </div>
+            <div>
+              <Label htmlFor="channel-description" className="text-white">Description</Label>
+              <Textarea
+                id="channel-description"
+                value={channelDescription}
+                onChange={(e) => setChannelDescription(e.target.value)}
+                placeholder="What's this channel about?"
+                className="bg-slate-800 border-slate-700 text-white mt-1"
+              />
+            </div>
+            <div className="flex items-center space-x-2">
+              <Switch
+                id="private-channel"
+                checked={isPrivateChannel}
+                onCheckedChange={setIsPrivateChannel}
+              />
+              <Label htmlFor="private-channel" className="text-white">Private Channel</Label>
+            </div>
+            <Button
+              onClick={handleCreateChannel}
+              disabled={createChannelMutation.isPending}
+              className="w-full bg-purple-600 hover:bg-purple-700"
+            >
+              {createChannelMutation.isPending ? (
+                <>Creating...</>
+              ) : (
+                <>Create Channel</>
+              )}
+            </Button>
+          </div>
+        </DialogContent>
+      </Dialog>
     </div>
   );
 }

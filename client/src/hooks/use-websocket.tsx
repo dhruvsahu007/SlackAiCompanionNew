@@ -81,7 +81,8 @@ export function useWebSocket() {
   const broadcastMessage = (channelId: number, messageData: any) => {
     sendMessage({
       type: 'new_message',
-      channelId,
+      channelId: channelId || null,
+      recipientId: messageData.recipientId || null,
       data: messageData
     });
   };

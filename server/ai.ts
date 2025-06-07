@@ -1,9 +1,18 @@
 import OpenAI from "openai";
 
-// the newest OpenAI model is "gpt-4o" which was released May 13, 2024. do not change this unless explicitly requested by the user
-const openai = new OpenAI({ 
-  apiKey: process.env.OPENAI_API_KEY || process.env.OPENAI_API_KEY_ENV_VAR || "default_key"
-});
+// Initialize OpenAI with proper error handling
+let openai: OpenAI;
+try {
+  const apiKey = process.env.OPENAI_API_KEY;
+  if (!apiKey) {
+    throw new Error("OpenAI API key is not configured in environment variables");
+  }
+  openai = new OpenAI({ apiKey });
+  console.log("[OpenAI] Successfully initialized with API key");
+} catch (error) {
+  console.error("[OpenAI] Initialization error:", error);
+  throw error;
+}
 
 export interface ToneAnalysis {
   tone: string;
@@ -11,12 +20,16 @@ export interface ToneAnalysis {
   clarity: string;
   confidence: number;
   suggestions?: string[];
+  suggestedTones: string[];
+  explanation: string;
 }
 
 export interface ReplyGeneration {
-  suggestedReply: string;
-  confidence: number;
-  reasoning: string;
+  suggestions: Array<{
+    suggestedReply: string;
+    confidence: number;
+    reasoning: string;
+  }>;
 }
 
 export interface OrgMemoryQuery {
@@ -42,26 +55,34 @@ export interface MeetingNotesGeneration {
 export async function analyzeTone(content: string): Promise<ToneAnalysis> {
   try {
     const response = await openai.chat.completions.create({
-      model: "gpt-4o",
+      model: "gpt-4",
       messages: [
         {
           role: "system",
-          content: `You are an expert communication analyst. Analyze the tone, impact, and clarity of messages. 
+          content: `You are an expert communication analyst. Analyze the tone, impact, and clarity of messages and provide improvement suggestions.
+          Your analysis should be thorough and include:
+          1. Current tone identification
+          2. Impact assessment
+          3. Clarity evaluation
+          4. Specific suggestions for improvement
+          5. Alternative tone suggestions that would be more appropriate
+
           Respond with JSON in this format: 
           { 
             "tone": "string (professional, casual, urgent, friendly, aggressive, etc.)", 
             "impact": "string (high, medium, low)",
             "clarity": "string (clear, somewhat clear, needs clarity)",
             "confidence": number (0-100),
-            "suggestions": ["array of improvement suggestions if needed"]
+            "suggestions": ["array of improvement suggestions"],
+            "suggestedTones": ["array of 2-3 alternative tones that might be more appropriate"],
+            "explanation": "string explaining why these tones would be better"
           }`
         },
         {
           role: "user",
           content: `Analyze this message: "${content}"`
-        },
-      ],
-      response_format: { type: "json_object" },
+        }
+      ]
     });
 
     const result = JSON.parse(response.choices[0].message.content || "{}");
@@ -70,7 +91,9 @@ export async function analyzeTone(content: string): Promise<ToneAnalysis> {
       impact: result.impact || "medium",
       clarity: result.clarity || "clear",
       confidence: Math.max(0, Math.min(100, result.confidence || 70)),
-      suggestions: result.suggestions || []
+      suggestions: result.suggestions || [],
+      suggestedTones: result.suggestedTones || [],
+      explanation: result.explanation || ""
     };
   } catch (error) {
     console.error("Failed to analyze tone:", error);
@@ -78,7 +101,10 @@ export async function analyzeTone(content: string): Promise<ToneAnalysis> {
       tone: "neutral",
       impact: "medium", 
       clarity: "clear",
-      confidence: 0
+      confidence: 0,
+      suggestions: [],
+      suggestedTones: [],
+      explanation: ""
     };
   }
 }
@@ -86,49 +112,106 @@ export async function analyzeTone(content: string): Promise<ToneAnalysis> {
 export async function generateReply(
   messageContent: string, 
   threadContext: string[], 
-  orgContext: string
+  orgContext: string,
+  generateMultiple: boolean = false
 ): Promise<ReplyGeneration> {
   try {
+    console.log("[AI Reply] Generating reply with:", {
+      messageContent,
+      threadContext,
+      orgContext,
+      generateMultiple
+    });
+
     const contextPrompt = `
     Thread context: ${threadContext.join('\n')}
     Organizational context: ${orgContext}
     `;
 
-    const response = await openai.chat.completions.create({
-      model: "gpt-4o",
-      messages: [
-        {
-          role: "system",
-          content: `You are an AI assistant helping to compose professional, contextually appropriate replies in a workplace chat.
-          Consider the thread context and organizational knowledge to generate helpful responses.
-          Respond with JSON in this format:
-          {
-            "suggestedReply": "string (the suggested response)",
-            "confidence": number (0-100),
-            "reasoning": "string (why this reply is appropriate)"
-          }`
-        },
-        {
-          role: "user",
-          content: `Generate a reply to: "${messageContent}"\n\n${contextPrompt}`
-        },
-      ],
-      response_format: { type: "json_object" },
-    });
+    if (!process.env.OPENAI_API_KEY) {
+      console.error("[AI Reply] Error: OpenAI API key is not set");
+      throw new Error("OpenAI API key is not configured");
+    }
 
-    const result = JSON.parse(response.choices[0].message.content || "{}");
-    return {
-      suggestedReply: result.suggestedReply || "Thank you for the update.",
-      confidence: Math.max(0, Math.min(100, result.confidence || 70)),
-      reasoning: result.reasoning || "Standard professional response"
-    };
+    console.log("[AI Reply] Making OpenAI API request...");
+    try {
+      const response = await openai.chat.completions.create({
+        model: "gpt-4",
+        messages: [
+          {
+            role: "system",
+            content: `You are an AI assistant helping to compose professional, contextually appropriate messages in a workplace chat.
+            Consider the thread context and channel information to generate helpful, relevant responses.
+            
+            When composing messages:
+            1. Consider the channel's purpose and recent conversation context
+            2. Maintain a professional and appropriate tone
+            3. Be concise but informative
+            4. Include relevant details from the context
+            5. Keep the message focused and on-topic for the channel
+            
+            You must respond with valid JSON only in this exact format:
+            {
+              "suggestions": [
+                {
+                  "suggestedReply": "string (the suggested response)",
+                  "confidence": number (0-100),
+                  "reasoning": "string (why this message is appropriate)"
+                }
+                // Generate 3 different suggestions with varying tones and approaches
+              ]
+            }
+            Do not include any other text or explanation outside the JSON.`
+          },
+          {
+            role: "user",
+            content: `Generate ${generateMultiple ? "3 different" : "1"} message(s) for this context:\n\n${contextPrompt}`
+          },
+        ],
+        temperature: 0.7,
+        max_tokens: 1000
+      });
+
+      console.log("[AI Reply] Received OpenAI response");
+      
+      try {
+        const content = response.choices[0].message.content;
+        if (!content) {
+          throw new Error("Empty response from OpenAI");
+        }
+        
+        const result = JSON.parse(content.trim());
+        console.log("[AI Reply] Parsed response:", result);
+
+        if (!Array.isArray(result.suggestions)) {
+          throw new Error("OpenAI response did not include suggestions array");
+        }
+
+        return {
+          suggestions: result.suggestions.map((suggestion: any) => ({
+            suggestedReply: suggestion.suggestedReply,
+            confidence: Math.max(0, Math.min(100, suggestion.confidence || 70)),
+            reasoning: suggestion.reasoning || "Standard professional response"
+          }))
+        };
+      } catch (parseError) {
+        console.error("[AI Reply] Failed to parse OpenAI response:", parseError);
+        console.error("[AI Reply] Raw response:", response.choices[0].message.content);
+        throw new Error("Failed to parse AI response");
+      }
+    } catch (apiError) {
+      console.error("[AI Reply] OpenAI API error:", apiError);
+      if (apiError instanceof Error) {
+        if (apiError.message.includes('API key')) {
+          throw new Error("Invalid OpenAI API key");
+        }
+        throw new Error(`OpenAI API error: ${apiError.message}`);
+      }
+      throw new Error("Failed to communicate with OpenAI API");
+    }
   } catch (error) {
-    console.error("Failed to generate reply:", error);
-    return {
-      suggestedReply: "Thank you for the update.",
-      confidence: 0,
-      reasoning: "Error occurred during generation"
-    };
+    console.error("[AI Reply] Error details:", error);
+    throw error;
   }
 }
 
@@ -137,17 +220,21 @@ export async function queryOrgMemory(
   relevantMessages: Array<{ content: string; channelName: string; authorName: string; timestamp: string }>
 ): Promise<OrgMemoryQuery> {
   try {
+    console.log("[AI] Processing org memory query:", query);
+    console.log("[AI] Processing", relevantMessages.length, "relevant messages");
+
     const messagesContext = relevantMessages.map(msg => 
       `[${msg.channelName}] ${msg.authorName} (${msg.timestamp}): ${msg.content}`
     ).join('\n');
 
     const response = await openai.chat.completions.create({
-      model: "gpt-4o",
+      model: "gpt-4",
       messages: [
         {
           role: "system",
           content: `You are an AI organizational memory assistant. Analyze relevant messages and provide comprehensive summaries.
-          Respond with JSON in this format:
+          IMPORTANT: Your response must be a valid JSON object with no additional text or explanations.
+          Required JSON format:
           {
             "query": "string (the original query)",
             "summary": "string (comprehensive summary)",
@@ -160,43 +247,52 @@ export async function queryOrgMemory(
           content: `Query: "${query}"\n\nRelevant messages:\n${messagesContext}`
         },
       ],
-      response_format: { type: "json_object" },
+      temperature: 0.7,
     });
 
-    const result = JSON.parse(response.choices[0].message.content || "{}");
-    
-    // Process sources
-    const sourceChannels = new Map();
-    relevantMessages.forEach(msg => {
-      if (!sourceChannels.has(msg.channelName)) {
-        sourceChannels.set(msg.channelName, { count: 0, lastUpdate: msg.timestamp });
-      }
-      sourceChannels.get(msg.channelName).count++;
-      if (msg.timestamp > sourceChannels.get(msg.channelName).lastUpdate) {
-        sourceChannels.get(msg.channelName).lastUpdate = msg.timestamp;
-      }
-    });
+    if (!response.choices[0].message.content) {
+      throw new Error("Empty response from OpenAI");
+    }
 
-    const sources = Array.from(sourceChannels.entries()).map(([name, data]) => ({
-      channelName: name,
-      messageCount: data.count,
-      lastUpdate: data.lastUpdate
-    }));
+    try {
+      const result = JSON.parse(response.choices[0].message.content.trim());
+      console.log("[AI] Successfully parsed org memory response");
+      
+      // Process sources
+      const sourceChannels = new Map();
+      relevantMessages.forEach(msg => {
+        if (!sourceChannels.has(msg.channelName)) {
+          sourceChannels.set(msg.channelName, { count: 0, lastUpdate: msg.timestamp });
+        }
+        sourceChannels.get(msg.channelName).count++;
+        if (msg.timestamp > sourceChannels.get(msg.channelName).lastUpdate) {
+          sourceChannels.get(msg.channelName).lastUpdate = msg.timestamp;
+        }
+      });
 
-    return {
-      query,
-      summary: result.summary || "No relevant information found.",
-      sources,
-      keyPoints: result.keyPoints || []
-    };
+      const sources = Array.from(sourceChannels.entries()).map(([name, data]) => ({
+        channelName: name,
+        messageCount: data.count,
+        lastUpdate: data.lastUpdate
+      }));
+
+      return {
+        query,
+        summary: result.summary || "No relevant information found.",
+        sources,
+        keyPoints: result.keyPoints || []
+      };
+    } catch (parseError) {
+      console.error("[AI] Failed to parse OpenAI response:", parseError);
+      console.error("[AI] Raw response:", response.choices[0].message.content);
+      throw new Error("Failed to parse AI response");
+    }
   } catch (error) {
-    console.error("Failed to query org memory:", error);
-    return {
-      query,
-      summary: "Error occurred while processing your query.",
-      sources: [],
-      keyPoints: []
-    };
+    console.error("[AI] Failed to query org memory:", error);
+    if (error instanceof Error) {
+      console.error("[AI] Error details:", error.message);
+    }
+    throw error;
   }
 }
 
@@ -205,17 +301,27 @@ export async function generateMeetingNotes(
   channelName: string
 ): Promise<MeetingNotesGeneration> {
   try {
+    console.log("[AI] Generating meeting notes for channel:", channelName);
+    console.log("[AI] Processing", messages.length, "messages");
+
+    if (!messages.length) {
+      console.warn("[AI] No messages provided for meeting notes generation");
+      throw new Error("No messages available to generate notes from");
+    }
+
     const messagesText = messages.map(msg => 
       `${msg.authorName} (${msg.timestamp}): ${msg.content}`
     ).join('\n');
 
+    console.log("[AI] Calling OpenAI API for meeting notes generation");
     const response = await openai.chat.completions.create({
-      model: "gpt-4o",
+      model: "gpt-4",
       messages: [
         {
           role: "system",
-          content: `You are an AI meeting notes generator. Extract key information from conversation threads.
-          Respond with JSON in this format:
+          content: `You are an AI meeting notes generator. Analyze the following conversation thread and extract key information.
+          IMPORTANT: Your response must be a valid JSON object with no additional text or explanations.
+          Required JSON format:
           {
             "title": "string (meeting title)",
             "summary": "string (brief summary)",
@@ -227,30 +333,46 @@ export async function generateMeetingNotes(
         },
         {
           role: "user",
-          content: `Generate meeting notes from this ${channelName} conversation:\n\n${messagesText}`
+          content: `Generate structured meeting notes from this ${channelName} conversation:\n\n${messagesText}`
         },
       ],
-      response_format: { type: "json_object" },
+      temperature: 0.7,
     });
 
-    const result = JSON.parse(response.choices[0].message.content || "{}");
-    return {
-      title: result.title || `${channelName} Discussion`,
-      summary: result.summary || "Discussion summary",
-      keyPoints: result.keyPoints || [],
-      actionItems: result.actionItems || [],
-      participants: result.participants || [],
-      decisions: result.decisions || []
-    };
+    console.log("[AI] Successfully received response from OpenAI");
+    
+    if (!response.choices[0].message.content) {
+      console.error("[AI] Empty response from OpenAI");
+      throw new Error("Failed to generate meeting notes: Empty response from AI");
+    }
+
+    try {
+      const result = JSON.parse(response.choices[0].message.content.trim());
+      console.log("[AI] Successfully parsed response:", result);
+
+      if (!result.title || !result.summary) {
+        throw new Error("Invalid response format from OpenAI");
+      }
+
+      return {
+        title: result.title,
+        summary: result.summary,
+        keyPoints: result.keyPoints || [],
+        actionItems: result.actionItems || [],
+        participants: result.participants || [],
+        decisions: result.decisions || []
+      };
+    } catch (parseError) {
+      console.error("[AI] Failed to parse OpenAI response:", parseError);
+      console.error("[AI] Raw response:", response.choices[0].message.content);
+      throw new Error("Failed to parse AI response. Please try again.");
+    }
   } catch (error) {
-    console.error("Failed to generate meeting notes:", error);
-    return {
-      title: `${channelName} Discussion`,
-      summary: "Error occurred while generating notes.",
-      keyPoints: [],
-      actionItems: [],
-      participants: [],
-      decisions: []
-    };
+    console.error("[AI] Failed to generate meeting notes:", error);
+    if (error instanceof Error) {
+      console.error("[AI] Error details:", error.message);
+      console.error("[AI] Error stack:", error.stack);
+    }
+    throw error; // Re-throw to let the route handler handle the error
   }
 }
