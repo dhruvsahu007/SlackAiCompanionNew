@@ -55,7 +55,7 @@ export interface MeetingNotesGeneration {
 export async function analyzeTone(content: string): Promise<ToneAnalysis> {
   try {
     const response = await openai.chat.completions.create({
-      model: "gpt-4",
+      model: "gpt-3.5-turbo",
       messages: [
         {
           role: "system",
@@ -136,7 +136,7 @@ export async function generateReply(
     console.log("[AI Reply] Making OpenAI API request...");
     try {
       const response = await openai.chat.completions.create({
-        model: "gpt-4",
+        model: "gpt-3.5-turbo",
         messages: [
           {
             role: "system",
@@ -228,7 +228,7 @@ export async function queryOrgMemory(
     ).join('\n');
 
     const response = await openai.chat.completions.create({
-      model: "gpt-4",
+      model: "gpt-3.5-turbo",
       messages: [
         {
           role: "system",
@@ -315,7 +315,7 @@ export async function generateMeetingNotes(
 
     console.log("[AI] Calling OpenAI API for meeting notes generation");
     const response = await openai.chat.completions.create({
-      model: "gpt-4",
+      model: "gpt-3.5-turbo",
       messages: [
         {
           role: "system",
