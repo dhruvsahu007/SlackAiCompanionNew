@@ -114,6 +114,27 @@ type ToastProps = React.ComponentPropsWithoutRef<typeof Toast>
 
 type ToastActionElement = React.ReactElement<typeof ToastAction>
 
+export function useToast() {
+  const [toasts, setToasts] = React.useState<ToastProps[]>([]);
+
+  const toast = React.useCallback(
+    ({ ...props }: ToastProps) => {
+      setToasts((prevToasts) => [...prevToasts, props]);
+    },
+    []
+  );
+
+  const dismiss = React.useCallback((id: string) => {
+    setToasts((prevToasts) => prevToasts.filter((toast) => toast.id !== id));
+  }, []);
+
+  return {
+    toast,
+    dismiss,
+    toasts,
+  };
+}
+
 export {
   type ToastProps,
   type ToastActionElement,
