@@ -6,7 +6,7 @@ A **Slack-like chat platform** powered by AI that enhances workplace communicati
 
 ## 🚀 Live Demo
 
-👉 [Live App on Render](https://slackaicompanionnew.onrender.com/)
+👉 [Live App on Render](https://slackai-oirf.onrender.com)
 
 ---
 
